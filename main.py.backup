@@ -1,0 +1,785 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import sqlite3
+from pathlib import Path
+from datetime import date, datetime
+import calendar as cal
+
+# =========================================================
+# MYPA - My Personal Assistant | Version 2.0
+# Tasks + Calendar + Notes + AI Assistant + Settings
+# =========================================================
+
+BG = "#F4F6FA"
+SIDEBAR = "#202B46"
+ACCENT = "#6C63FF"
+TEXT = "#202B46"
+MUTED = "#68738A"
+WHITE = "#FFFFFF"
+GREEN = "#16A085"
+RED = "#E74C3C"
+ORANGE = "#E67E22"
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "mypa.db"
+
+db = sqlite3.connect(str(DB_PATH))
+db.execute("PRAGMA foreign_keys = ON")
+cur = db.cursor()
+
+# Create tables, keeping existing tasks intact.
+cur.execute("""
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0
+)
+""")
+cur.execute("PRAGMA table_info(tasks)")
+task_columns = [r[1] for r in cur.fetchall()]
+if "deadline" not in task_columns:
+    cur.execute("ALTER TABLE tasks ADD COLUMN deadline TEXT")
+if "priority" not in task_columns:
+    cur.execute("ALTER TABLE tasks ADD COLUMN priority TEXT DEFAULT 'Sedang'")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_date TEXT NOT NULL,
+    title TEXT NOT NULL,
+    details TEXT DEFAULT ''
+)
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    content TEXT DEFAULT '',
+    updated_at TEXT NOT NULL
+)
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+""")
+db.commit()
+
+
+def setting_get(key, default=""):
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def setting_set(key, value):
+    db.execute(
+        "INSERT INTO settings(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value))
+    )
+    db.commit()
+
+
+# ------------------------- Root and styles -------------------------
+
+root = tk.Tk()
+root.title("MYPA - My Personal Assistant")
+root.geometry("1180x760")
+root.minsize(900, 620)
+root.configure(bg=BG)
+
+style = ttk.Style()
+try:
+    style.theme_use("clam")
+except tk.TclError:
+    pass
+style.configure("Treeview", rowheight=28, font=("Segoe UI", 10))
+style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+style.configure("TCombobox", padding=4)
+
+current_page = "Dashboard"
+selected_calendar_date = date.today()
+calendar_year = date.today().year
+calendar_month = date.today().month
+selected_note_id = None
+
+
+def make_button(parent, text, command, bg=ACCENT, fg=WHITE, **kwargs):
+    return tk.Button(
+        parent, text=text, command=command, bg=bg, fg=fg,
+        activebackground=bg, activeforeground=fg,
+        relief="flat", bd=0, padx=12, pady=8,
+        font=("Segoe UI", 9, "bold"), cursor="hand2", **kwargs
+    )
+
+
+def make_label(parent, text, size=10, bold=False, color=TEXT, bg=None, **kwargs):
+    return tk.Label(
+        parent, text=text,
+        font=("Segoe UI", size, "bold" if bold else "normal"),
+        fg=color, bg=bg or BG, **kwargs
+    )
+
+
+def panel(parent, **kwargs):
+    return tk.Frame(
+        parent, bg=WHITE, highlightbackground="#E1E5EF",
+        highlightthickness=1, **kwargs
+    )
+
+
+# ------------------------- Main layout -------------------------
+
+sidebar = tk.Frame(root, bg=SIDEBAR, width=215)
+sidebar.pack(side="left", fill="y")
+sidebar.pack_propagate(False)
+
+make_label(sidebar, "MYPA", 27, True, WHITE, SIDEBAR).pack(pady=(28, 2))
+make_label(sidebar, "My Personal Assistant", 9, False, "#C7CEE0", SIDEBAR).pack(pady=(0, 28))
+
+content = tk.Frame(root, bg=BG)
+content.pack(side="left", fill="both", expand=True, padx=24, pady=20)
+
+page_title = make_label(content, "Dashboard", 24, True, TEXT, BG)
+page_title.pack(anchor="w", pady=(0, 14))
+
+page_host = tk.Frame(content, bg=BG)
+page_host.pack(fill="both", expand=True)
+
+pages = {}
+
+
+def register_page(name):
+    frame = tk.Frame(page_host, bg=BG)
+    pages[name] = frame
+    return frame
+
+
+def show_page(name):
+    global current_page
+    current_page = name
+    for frame in pages.values():
+        frame.pack_forget()
+    pages[name].pack(fill="both", expand=True)
+    page_title.config(text=name)
+    if name == "Dashboard":
+        update_dashboard()
+    elif name == "Tasks":
+        refresh_tasks()
+    elif name == "Calendar":
+        render_calendar()
+    elif name == "Notes":
+        refresh_notes()
+    elif name == "Settings":
+        load_settings_page()
+
+
+def nav_button(label, page):
+    tk.Button(
+        sidebar, text="   " + label, anchor="w",
+        font=("Segoe UI", 11), fg=WHITE, bg=SIDEBAR,
+        activebackground=ACCENT, activeforeground=WHITE,
+        relief="flat", bd=0, padx=14, pady=12,
+        cursor="hand2", command=lambda: show_page(page)
+    ).pack(fill="x", padx=10, pady=2)
+
+
+for label in ("Dashboard", "Tasks", "Calendar", "Notes", "AI Assistant", "Settings"):
+    nav_button(label, label)
+
+make_label(sidebar, "MYPA Version 2.0", 9, False, "#C7CEE0", SIDEBAR).pack(side="bottom", pady=18)
+
+# =============================== Dashboard ===============================
+
+dashboard_page = register_page("Dashboard")
+make_label(dashboard_page, f"Welcome, {setting_get('username', 'there')}!", 18, True, TEXT, BG).pack(anchor="w", pady=(4, 14))
+
+cards = tk.Frame(dashboard_page, bg=BG)
+cards.pack(fill="x")
+
+
+def dashboard_card(parent, title, color):
+    box = panel(parent)
+    box.pack(side="left", fill="x", expand=True, padx=(0, 10))
+    make_label(box, title, 10, False, MUTED, WHITE).pack(anchor="w", padx=15, pady=(15, 5))
+    value = make_label(box, "0", 24, True, color, WHITE)
+    value.pack(anchor="w", padx=15, pady=(0, 15))
+    return value
+
+
+total_value = dashboard_card(cards, "Total Tasks", ACCENT)
+completed_value = dashboard_card(cards, "Completed", GREEN)
+remaining_value = dashboard_card(cards, "Remaining", RED)
+
+dash_bottom = tk.Frame(dashboard_page, bg=BG)
+dash_bottom.pack(fill="both", expand=True, pady=(20, 0))
+
+today_panel = panel(dash_bottom)
+today_panel.pack(fill="both", expand=True)
+make_label(today_panel, "Today's Overview", 15, True, TEXT, WHITE).pack(anchor="w", padx=18, pady=(16, 8))
+today_text = tk.Text(today_panel, height=8, wrap="word", font=("Segoe UI", 11), bd=0, bg=WHITE, fg=MUTED)
+today_text.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+today_text.configure(state="disabled")
+
+
+def update_dashboard():
+    rows = db.execute("SELECT done, deadline, name FROM tasks").fetchall()
+    total = len(rows)
+    completed = sum(1 for r in rows if r[0])
+    total_value.config(text=str(total))
+    completed_value.config(text=str(completed))
+    remaining_value.config(text=str(total - completed))
+
+    today = date.today().isoformat()
+    due_today = [r[2] for r in rows if not r[0] and r[1] == today]
+    upcoming = db.execute(
+        "SELECT title FROM events WHERE event_date=? ORDER BY id", (today,)
+    ).fetchall()
+    lines = [f"Today: {date.today().strftime('%d %B %Y')}", ""]
+    lines.append("Tasks due today:")
+    lines.extend([f"• {x}" for x in due_today] or ["• No tasks due today."])
+    lines += ["", "Calendar events today:"]
+    lines.extend([f"• {x[0]}" for x in upcoming] or ["• No events scheduled."])
+    today_text.configure(state="normal")
+    today_text.delete("1.0", tk.END)
+    today_text.insert("1.0", "\n".join(lines))
+    today_text.configure(state="disabled")
+
+
+# =============================== Tasks ===============================
+
+tasks_page = register_page("Tasks")
+make_label(tasks_page, "Manage your tasks, deadlines, and priorities.", 10, False, MUTED, BG).pack(anchor="w", pady=(0, 10))
+
+task_form = panel(tasks_page)
+task_form.pack(fill="x", pady=(0, 10))
+make_label(task_form, "New Task", 12, True, TEXT, WHITE).pack(anchor="w", padx=12, pady=(10, 6))
+
+form = tk.Frame(task_form, bg=WHITE)
+form.pack(fill="x", padx=12, pady=(0, 12))
+
+make_label(form, "Task name", 9, False, TEXT, WHITE).grid(row=0, column=0, sticky="w", padx=(0, 8))
+make_label(form, "Deadline (YYYY-MM-DD)", 9, False, TEXT, WHITE).grid(row=0, column=1, sticky="w", padx=(0, 8))
+make_label(form, "Priority", 9, False, TEXT, WHITE).grid(row=0, column=2, sticky="w", padx=(0, 8))
+
+task_name_entry = tk.Entry(form, font=("Segoe UI", 10))
+task_name_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8), ipady=5)
+task_deadline_entry = tk.Entry(form, font=("Segoe UI", 10))
+task_deadline_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), ipady=5)
+task_deadline_entry.insert(0, date.today().isoformat())
+task_priority_var = tk.StringVar(value="Sedang")
+ttk.Combobox(form, textvariable=task_priority_var, values=["Tinggi", "Sedang", "Rendah"], state="readonly", width=10).grid(row=1, column=2, padx=(0, 8), ipady=3)
+make_button(form, "Add Task", lambda: add_task()).grid(row=1, column=3)
+form.columnconfigure(0, weight=3)
+form.columnconfigure(1, weight=2)
+
+task_tools = tk.Frame(tasks_page, bg=BG)
+task_tools.pack(fill="x", pady=(0, 8))
+make_label(task_tools, "Search", 9, False, TEXT, BG).pack(side="left", padx=(0, 5))
+task_search_var = tk.StringVar()
+tk.Entry(task_tools, textvariable=task_search_var, width=24, font=("Segoe UI", 10)).pack(side="left", padx=(0, 12))
+make_label(task_tools, "Filter", 9, False, TEXT, BG).pack(side="left", padx=(0, 5))
+task_filter_var = tk.StringVar(value="Semua")
+ttk.Combobox(task_tools, textvariable=task_filter_var, values=["Semua", "Belum selesai", "Selesai"], state="readonly", width=15).pack(side="left")
+
+task_table_frame = panel(tasks_page)
+task_table_frame.pack(fill="both", expand=True)
+task_columns = ("name", "deadline", "priority", "status")
+task_tree = ttk.Treeview(task_table_frame, columns=task_columns, show="headings", selectmode="browse")
+for col, label, width in [
+    ("name", "Task", 300), ("deadline", "Deadline", 120),
+    ("priority", "Priority", 100), ("status", "Status", 130)
+]:
+    task_tree.heading(col, text=label)
+    task_tree.column(col, width=width, anchor="w" if col == "name" else "center")
+task_scroll = ttk.Scrollbar(task_table_frame, orient="vertical", command=task_tree.yview)
+task_tree.configure(yscrollcommand=task_scroll.set)
+task_tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+task_scroll.pack(side="right", fill="y", padx=(0, 5), pady=8)
+task_tree.tag_configure("Tinggi", foreground=RED)
+task_tree.tag_configure("Sedang", foreground=ORANGE)
+task_tree.tag_configure("Rendah", foreground=GREEN)
+task_tree.tag_configure("done", foreground=MUTED)
+
+task_actions = tk.Frame(tasks_page, bg=BG)
+task_actions.pack(fill="x", pady=(10, 0))
+
+
+def validate_date(value, parent=None):
+    if not value:
+        return True
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return True
+    except ValueError:
+        messagebox.showwarning("Invalid date", "Use YYYY-MM-DD, for example 2026-10-25.", parent=parent or root)
+        return False
+
+
+def get_selected_task():
+    selected = task_tree.selection()
+    if not selected:
+        messagebox.showwarning("Select task", "Choose a task from the list first.")
+        return None
+    task_id = int(selected[0])
+    return next((t for t in get_tasks() if t["id"] == task_id), None)
+
+
+def get_tasks():
+    rows = db.execute("SELECT id, name, done, deadline, priority FROM tasks ORDER BY id DESC").fetchall()
+    return [{"id": r[0], "name": r[1], "done": bool(r[2]), "deadline": r[3] or "", "priority": r[4] or "Sedang"} for r in rows]
+
+
+def add_task():
+    name = task_name_entry.get().strip()
+    deadline = task_deadline_entry.get().strip()
+    priority = task_priority_var.get()
+    if not name:
+        messagebox.showwarning("Missing task", "Enter a task name.")
+        return
+    if not validate_date(deadline):
+        return
+    db.execute("INSERT INTO tasks(name, done, deadline, priority) VALUES(?, 0, ?, ?)", (name, deadline or None, priority))
+    db.commit()
+    task_name_entry.delete(0, tk.END)
+    refresh_tasks()
+
+
+def refresh_tasks():
+    for item in task_tree.get_children():
+        task_tree.delete(item)
+    keyword = task_search_var.get().strip().lower()
+    status_filter = task_filter_var.get()
+    for t in get_tasks():
+        if keyword not in t["name"].lower():
+            continue
+        if status_filter == "Belum selesai" and t["done"]:
+            continue
+        if status_filter == "Selesai" and not t["done"]:
+            continue
+        status = "Selesai" if t["done"] else "Belum selesai"
+        task_tree.insert("", tk.END, iid=str(t["id"]), values=(t["name"], t["deadline"] or "-", t["priority"], status), tags=("done" if t["done"] else t["priority"],))
+    update_dashboard()
+
+
+def toggle_task():
+    t = get_selected_task()
+    if t:
+        db.execute("UPDATE tasks SET done=? WHERE id=?", (0 if t["done"] else 1, t["id"]))
+        db.commit()
+        refresh_tasks()
+
+
+def delete_task():
+    t = get_selected_task()
+    if t and messagebox.askyesno("Delete task", f"Delete '{t['name']}'?"):
+        db.execute("DELETE FROM tasks WHERE id=?", (t["id"],))
+        db.commit()
+        refresh_tasks()
+
+
+def edit_task():
+    t = get_selected_task()
+    if not t:
+        return
+    win = tk.Toplevel(root)
+    win.title("Edit Task")
+    win.geometry("390x310")
+    win.configure(bg=BG)
+    win.transient(root)
+    win.grab_set()
+    make_label(win, "Edit Task", 17, True, TEXT, BG).pack(anchor="w", padx=18, pady=(16, 10))
+    make_label(win, "Task name", 10, False, TEXT, BG).pack(anchor="w", padx=18)
+    name = tk.Entry(win, font=("Segoe UI", 10))
+    name.pack(fill="x", padx=18, pady=(4, 10))
+    name.insert(0, t["name"])
+    make_label(win, "Deadline (YYYY-MM-DD)", 10, False, TEXT, BG).pack(anchor="w", padx=18)
+    deadline = tk.Entry(win, font=("Segoe UI", 10))
+    deadline.pack(fill="x", padx=18, pady=(4, 10))
+    deadline.insert(0, t["deadline"])
+    make_label(win, "Priority", 10, False, TEXT, BG).pack(anchor="w", padx=18)
+    priority = tk.StringVar(value=t["priority"])
+    ttk.Combobox(win, textvariable=priority, values=["Tinggi", "Sedang", "Rendah"], state="readonly").pack(fill="x", padx=18, pady=(4, 12))
+
+    def save():
+        new_name, new_deadline = name.get().strip(), deadline.get().strip()
+        if not new_name:
+            messagebox.showwarning("Missing name", "Task name cannot be empty.", parent=win)
+            return
+        if not validate_date(new_deadline, win):
+            return
+        db.execute("UPDATE tasks SET name=?, deadline=?, priority=? WHERE id=?", (new_name, new_deadline or None, priority.get(), t["id"]))
+        db.commit()
+        win.destroy()
+        refresh_tasks()
+
+    make_button(win, "Save Changes", save).pack(pady=4)
+
+
+make_button(task_actions, "Mark Complete / Undo", toggle_task, GREEN).pack(side="left", padx=(0, 7))
+make_button(task_actions, "Edit Task", edit_task).pack(side="left", padx=(0, 7))
+make_button(task_actions, "Delete Task", delete_task, RED).pack(side="left")
+task_search_var.trace_add("write", lambda *_: refresh_tasks())
+task_filter_var.trace_add("write", lambda *_: refresh_tasks())
+task_name_entry.bind("<Return>", lambda e: add_task())
+
+# =============================== Calendar ===============================
+
+calendar_page = register_page("Calendar")
+make_label(calendar_page, "Plan events and appointments by date.", 10, False, MUTED, BG).pack(anchor="w", pady=(0, 12))
+calendar_top = tk.Frame(calendar_page, bg=BG)
+calendar_top.pack(fill="x", pady=(0, 10))
+calendar_heading = make_label(calendar_top, "", 16, True, TEXT, BG)
+calendar_heading.pack(side="left")
+make_button(calendar_top, "Next month ▶", lambda: change_month(1)).pack(side="right")
+make_button(calendar_top, "◀ Previous", lambda: change_month(-1)).pack(side="right", padx=6)
+make_button(calendar_top, "Today", lambda: go_today()).pack(side="right", padx=6)
+
+calendar_body = panel(calendar_page)
+calendar_body.pack(fill="x", pady=(0, 12))
+calendar_grid = tk.Frame(calendar_body, bg=WHITE)
+calendar_grid.pack(fill="x", padx=8, pady=8)
+
+event_panel = panel(calendar_page)
+event_panel.pack(fill="both", expand=True)
+event_form = tk.Frame(event_panel, bg=WHITE)
+event_form.pack(fill="x", padx=12, pady=12)
+make_label(event_form, "Event for selected date", 12, True, TEXT, WHITE).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+selected_date_label = make_label(event_form, "", 10, True, ACCENT, WHITE)
+selected_date_label.grid(row=1, column=0, sticky="w", padx=(0, 10))
+event_title_entry = tk.Entry(event_form, font=("Segoe UI", 10), width=28)
+event_title_entry.grid(row=1, column=1, padx=(0, 8), ipady=5)
+event_title_entry.insert(0, "")
+make_button(event_form, "Add Event", lambda: add_event()).grid(row=1, column=2)
+event_form.columnconfigure(1, weight=1)
+
+event_list = tk.Listbox(event_panel, font=("Segoe UI", 10), height=5, selectmode=tk.SINGLE)
+event_list.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+event_actions = tk.Frame(event_panel, bg=WHITE)
+event_actions.pack(fill="x", padx=12, pady=(0, 12))
+make_button(event_actions, "Delete Selected Event", lambda: delete_event(), RED).pack(side="left")
+
+
+def change_month(amount):
+    global calendar_year, calendar_month
+    calendar_month += amount
+    if calendar_month > 12:
+        calendar_month = 1
+        calendar_year += 1
+    elif calendar_month < 1:
+        calendar_month = 12
+        calendar_year -= 1
+    render_calendar()
+
+
+def go_today():
+    global calendar_year, calendar_month, selected_calendar_date
+    selected_calendar_date = date.today()
+    calendar_year, calendar_month = date.today().year, date.today().month
+    render_calendar()
+
+
+def select_calendar_date(day):
+    global selected_calendar_date
+    selected_calendar_date = date(calendar_year, calendar_month, day)
+    render_calendar()
+
+
+def render_calendar():
+    for widget in calendar_grid.winfo_children():
+        widget.destroy()
+    calendar_heading.config(text=f"{cal.month_name[calendar_month]} {calendar_year}")
+    selected_date_label.config(text=selected_calendar_date.strftime("%d %B %Y"))
+    for col, day_name in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
+        make_label(calendar_grid, day_name, 9, True, MUTED, WHITE, width=8).grid(row=0, column=col, padx=2, pady=3)
+    month = cal.monthcalendar(calendar_year, calendar_month)
+    for r, week in enumerate(month, start=1):
+        for c, day in enumerate(week):
+            if day == 0:
+                tk.Label(calendar_grid, text="", bg=WHITE, width=8, height=2).grid(row=r, column=c, padx=2, pady=2)
+                continue
+            day_date = date(calendar_year, calendar_month, day)
+            has_event = db.execute("SELECT 1 FROM events WHERE event_date=? LIMIT 1", (day_date.isoformat(),)).fetchone()
+            label = f"{day}\n•" if has_event else str(day)
+            bg = ACCENT if day_date == selected_calendar_date else ("#E5F7F1" if day_date == date.today() else "#F4F6FA")
+            fg = WHITE if day_date == selected_calendar_date else TEXT
+            tk.Button(
+                calendar_grid, text=label, width=8, height=2, bg=bg, fg=fg,
+                relief="flat", cursor="hand2",
+                command=lambda d=day: select_calendar_date(d)
+            ).grid(row=r, column=c, padx=2, pady=2)
+    refresh_event_list()
+
+
+def refresh_event_list():
+    event_list.delete(0, tk.END)
+    rows = db.execute("SELECT id, title FROM events WHERE event_date=? ORDER BY id", (selected_calendar_date.isoformat(),)).fetchall()
+    for event_id, title in rows:
+        event_list.insert(tk.END, f"{event_id} | {title}")
+    if not rows:
+        event_list.insert(tk.END, "No events for this date.")
+
+
+def add_event():
+    title = event_title_entry.get().strip()
+    if not title:
+        messagebox.showwarning("Missing event", "Enter an event title.")
+        return
+    db.execute("INSERT INTO events(event_date, title) VALUES(?, ?)", (selected_calendar_date.isoformat(), title))
+    db.commit()
+    event_title_entry.delete(0, tk.END)
+    render_calendar()
+    update_dashboard()
+
+
+def delete_event():
+    selected = event_list.curselection()
+    if not selected:
+        messagebox.showwarning("Select event", "Select an event to delete.")
+        return
+    text = event_list.get(selected[0])
+    if "|" not in text:
+        return
+    event_id = int(text.split("|", 1)[0].strip())
+    if messagebox.askyesno("Delete event", "Delete the selected event?"):
+        db.execute("DELETE FROM events WHERE id=?", (event_id,))
+        db.commit()
+        render_calendar()
+        update_dashboard()
+
+
+# =============================== Notes ===============================
+
+notes_page = register_page("Notes")
+make_label(notes_page, "Write down ideas, reminders, and important information.", 10, False, MUTED, BG).pack(anchor="w", pady=(0, 12))
+notes_split = tk.Frame(notes_page, bg=BG)
+notes_split.pack(fill="both", expand=True)
+
+notes_left = panel(notes_split)
+notes_left.pack(side="left", fill="y", padx=(0, 12))
+notes_left.configure(width=250)
+notes_left.pack_propagate(False)
+make_label(notes_left, "My Notes", 13, True, TEXT, WHITE).pack(anchor="w", padx=12, pady=(12, 8))
+note_search_var = tk.StringVar()
+tk.Entry(notes_left, textvariable=note_search_var, font=("Segoe UI", 10)).pack(fill="x", padx=12, pady=(0, 8))
+notes_list = tk.Listbox(notes_left, font=("Segoe UI", 10), activestyle="dotbox")
+notes_list.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+make_button(notes_left, "+ New Note", lambda: new_note()).pack(fill="x", padx=12, pady=(0, 12))
+
+notes_right = panel(notes_split)
+notes_right.pack(side="left", fill="both", expand=True)
+make_label(notes_right, "Note title", 10, True, TEXT, WHITE).pack(anchor="w", padx=14, pady=(14, 5))
+note_title_entry = tk.Entry(notes_right, font=("Segoe UI", 11))
+note_title_entry.pack(fill="x", padx=14, pady=(0, 10), ipady=5)
+make_label(notes_right, "Content", 10, True, TEXT, WHITE).pack(anchor="w", padx=14, pady=(0, 5))
+note_content = tk.Text(notes_right, font=("Segoe UI", 10), wrap="word", undo=True, height=15)
+note_content.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+note_buttons = tk.Frame(notes_right, bg=WHITE)
+note_buttons.pack(fill="x", padx=14, pady=(0, 14))
+make_button(note_buttons, "Save Note", lambda: save_note(), GREEN).pack(side="left", padx=(0, 7))
+make_button(note_buttons, "Delete Note", lambda: delete_note(), RED).pack(side="left")
+note_ids = []
+
+
+def refresh_notes():
+    global note_ids
+    note_search = note_search_var.get().strip().lower()
+    notes_list.delete(0, tk.END)
+    note_ids = []
+    rows = db.execute("SELECT id, title, content FROM notes ORDER BY updated_at DESC, id DESC").fetchall()
+    for note_id, title, content in rows:
+        if note_search and note_search not in (title + " " + (content or "")).lower():
+            continue
+        note_ids.append(note_id)
+        notes_list.insert(tk.END, title or "(Untitled)")
+    if selected_note_id in note_ids:
+        idx = note_ids.index(selected_note_id)
+        notes_list.selection_set(idx)
+
+
+def on_note_select(event=None):
+    global selected_note_id
+    selection = notes_list.curselection()
+    if not selection:
+        return
+    selected_note_id = note_ids[selection[0]]
+    row = db.execute("SELECT title, content FROM notes WHERE id=?", (selected_note_id,)).fetchone()
+    if row:
+        note_title_entry.delete(0, tk.END)
+        note_title_entry.insert(0, row[0])
+        note_content.delete("1.0", tk.END)
+        note_content.insert("1.0", row[1] or "")
+
+
+def new_note():
+    global selected_note_id
+    selected_note_id = None
+    notes_list.selection_clear(0, tk.END)
+    note_title_entry.delete(0, tk.END)
+    note_content.delete("1.0", tk.END)
+    note_title_entry.focus_set()
+
+
+def save_note():
+    global selected_note_id
+    title = note_title_entry.get().strip()
+    content = note_content.get("1.0", "end-1c").strip()
+    if not title:
+        messagebox.showwarning("Missing title", "Give your note a title.")
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    if selected_note_id is None:
+        cur = db.execute("INSERT INTO notes(title, content, updated_at) VALUES(?, ?, ?)", (title, content, now))
+        selected_note_id = cur.lastrowid
+    else:
+        db.execute("UPDATE notes SET title=?, content=?, updated_at=? WHERE id=?", (title, content, now, selected_note_id))
+    db.commit()
+    refresh_notes()
+    messagebox.showinfo("Saved", "Your note has been saved.")
+
+
+def delete_note():
+    global selected_note_id
+    if selected_note_id is None:
+        messagebox.showwarning("Select note", "Choose a note first.")
+        return
+    if messagebox.askyesno("Delete note", "Delete this note permanently?"):
+        db.execute("DELETE FROM notes WHERE id=?", (selected_note_id,))
+        db.commit()
+        selected_note_id = None
+        new_note()
+        refresh_notes()
+
+
+notes_list.bind("<<ListboxSelect>>", on_note_select)
+note_search_var.trace_add("write", lambda *_: refresh_notes())
+
+# =============================== AI Assistant ===============================
+
+ai_page = register_page("AI Assistant")
+make_label(ai_page, "MYPA Assistant", 18, True, TEXT, BG).pack(anchor="w", pady=(0, 5))
+make_label(ai_page, "This starter assistant works locally using simple rules; it is not connected to an online AI model.", 9, False, MUTED, BG, wraplength=800, justify="left").pack(anchor="w", pady=(0, 12))
+
+chat_panel = panel(ai_page)
+chat_panel.pack(fill="both", expand=True)
+chat_log = tk.Text(chat_panel, wrap="word", font=("Segoe UI", 10), bg=WHITE, fg=TEXT, bd=0, state="disabled")
+chat_log.pack(fill="both", expand=True, padx=12, pady=12)
+chat_log.tag_configure("user", foreground=ACCENT, font=("Segoe UI", 10, "bold"))
+chat_log.tag_configure("assistant", foreground=GREEN, font=("Segoe UI", 10, "bold"))
+
+chat_bottom = tk.Frame(ai_page, bg=BG)
+chat_bottom.pack(fill="x", pady=(10, 0))
+chat_input = tk.Entry(chat_bottom, font=("Segoe UI", 11))
+chat_input.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 8))
+make_button(chat_bottom, "Send", lambda: send_chat()).pack(side="right")
+
+
+def append_chat(sender, message, tag):
+    chat_log.configure(state="normal")
+    chat_log.insert(tk.END, sender + ": ", tag)
+    chat_log.insert(tk.END, message + "\n\n")
+    chat_log.configure(state="disabled")
+    chat_log.see(tk.END)
+
+
+def assistant_reply(message):
+    text = message.lower()
+    if any(word in text for word in ["halo", "hai", "hello", "hi"]):
+        return "Halo! Aku MYPA Assistant. Kamu bisa bertanya tentang tugas, deadline, atau cara memakai MYPA."
+    if "tugas" in text or "task" in text:
+        rows = db.execute("SELECT name, done, deadline, priority FROM tasks ORDER BY done, deadline").fetchall()
+        if not rows:
+            return "Belum ada tugas tersimpan. Buka menu Tasks untuk menambahkan tugas."
+        lines = []
+        for name, done, deadline, priority in rows[:8]:
+            state = "Selesai" if done else "Belum selesai"
+            due = deadline or "tanpa deadline"
+            lines.append(f"• {name} — {state}; deadline: {due}; prioritas: {priority or 'Sedang'}")
+        return "Berikut ringkasan tugasmu:\n" + "\n".join(lines)
+    if "jadwal" in text or "kalender" in text or "calendar" in text:
+        rows = db.execute("SELECT event_date, title FROM events WHERE event_date >= ? ORDER BY event_date LIMIT 8", (date.today().isoformat(),)).fetchall()
+        if not rows:
+            return "Belum ada kegiatan mendatang di Calendar. Tambahkan kegiatan melalui menu Calendar."
+        return "Kegiatan mendatang:\n" + "\n".join(f"• {d}: {title}" for d, title in rows)
+    if "catatan" in text or "notes" in text:
+        rows = db.execute("SELECT title FROM notes ORDER BY updated_at DESC LIMIT 8").fetchall()
+        return "Catatan tersimpan:\n" + ("\n".join(f"• {r[0]}" for r in rows) if rows else "Belum ada catatan. Kamu bisa membuatnya di menu Notes.")
+    if "prioritas" in text or "mulai" in text or "sibuk" in text:
+        row = db.execute("SELECT name, deadline, priority FROM tasks WHERE done=0 ORDER BY CASE priority WHEN 'Tinggi' THEN 1 WHEN 'Sedang' THEN 2 ELSE 3 END, deadline LIMIT 1").fetchone()
+        if row:
+            return f"Coba mulai dari '{row[0]}'. Prioritasnya {row[2] or 'Sedang'} dan deadline-nya {row[1] or 'belum ditentukan'}. Pecah tugas besar menjadi langkah kecil."
+        return "Tidak ada tugas aktif saat ini. Tambahkan tugas baru agar kita bisa menyusun prioritas."
+    if "bantu" in text or "help" in text:
+        return "Aku bisa merangkum tugas, melihat kegiatan kalender, menunjukkan catatan, atau memberi saran sederhana untuk memulai tugas. Coba tulis: 'Apa tugasku?'"
+    return "Aku masih menggunakan respons lokal sederhana. Coba tanyakan tentang tugas, kalender, catatan, prioritas, atau ketik 'bantu'. AI online bisa diintegrasikan nanti dengan API dan koneksi internet."
+
+
+def send_chat(event=None):
+    message = chat_input.get().strip()
+    if not message:
+        return
+    chat_input.delete(0, tk.END)
+    append_chat("Kamu", message, "user")
+    append_chat("MYPA", assistant_reply(message), "assistant")
+
+
+chat_input.bind("<Return>", send_chat)
+append_chat("MYPA", "Halo! Aku MYPA Assistant. Ketik 'bantu' untuk melihat apa yang bisa kulakukan.", "assistant")
+
+# =============================== Settings ===============================
+
+settings_page = register_page("Settings")
+make_label(settings_page, "Personalize your MYPA experience.", 10, False, MUTED, BG).pack(anchor="w", pady=(0, 12))
+settings_panel = panel(settings_page)
+settings_panel.pack(fill="x")
+make_label(settings_panel, "Preferences", 15, True, TEXT, WHITE).pack(anchor="w", padx=18, pady=(18, 12))
+
+make_label(settings_panel, "Your name", 10, True, TEXT, WHITE).pack(anchor="w", padx=18)
+username_entry = tk.Entry(settings_panel, font=("Segoe UI", 11))
+username_entry.pack(fill="x", padx=18, pady=(5, 14), ipady=5)
+
+make_label(settings_panel, "Theme", 10, True, TEXT, WHITE).pack(anchor="w", padx=18)
+theme_var = tk.StringVar(value=setting_get("theme", "Light"))
+theme_combo = ttk.Combobox(settings_panel, textvariable=theme_var, values=["Light", "Dark"], state="readonly", width=18)
+theme_combo.pack(anchor="w", padx=18, pady=(5, 14))
+
+settings_status = make_label(settings_panel, "", 9, False, GREEN, WHITE)
+settings_status.pack(anchor="w", padx=18, pady=(0, 8))
+make_button(settings_panel, "Save Settings", lambda: save_settings()).pack(anchor="w", padx=18, pady=(0, 18))
+
+
+def load_settings_page():
+    username_entry.delete(0, tk.END)
+    username_entry.insert(0, setting_get("username", ""))
+    theme_var.set(setting_get("theme", "Light"))
+
+
+def save_settings():
+    username = username_entry.get().strip() or "there"
+    theme = theme_var.get()
+    setting_set("username", username)
+    setting_set("theme", theme)
+    settings_status.config(text="Settings saved. Restart MYPA to apply the theme selection.")
+    dashboard_welcome = f"Welcome, {username}!"
+    # Update dashboard welcome label if it exists.
+    for widget in dashboard_page.winfo_children():
+        if isinstance(widget, tk.Label) and str(widget.cget("text")).startswith("Welcome,"):
+            widget.config(text=dashboard_welcome)
+    messagebox.showinfo("Settings saved", "Your settings have been saved.")
+    # Theme choice is saved; this version keeps the current color scheme until theme styling is expanded.
+
+
+# =============================== Startup / shutdown ===============================
+
+def close_app():
+    try:
+        db.commit()
+        db.close()
+    finally:
+        root.destroy()
+
+
+root.protocol("WM_DELETE_WINDOW", close_app)
+show_page("Dashboard")
+root.mainloop()
